@@ -35,6 +35,13 @@ Examples:
         choices=['eng', 'ron', 'eng+ron', 'fra', 'deu', 'spa', 'ita', 'por', 'rus', 'chi_sim', 'jpn'],
         help='Language for OCR (default: eng, use eng+ron for mixed content)'
     )
+
+    parser.add_argument(
+        '--engine', '-e',
+        default='tesseract',
+        choices=['tesseract', 'easyocr', 'keras', 'trocr', 'azure', 'google'],
+        help='OCR engine to use (default: tesseract, cloud engines require API credentials)'
+    )
     
     parser.add_argument(
         '--output', '-o',
@@ -87,6 +94,7 @@ Examples:
     if args.verbose:
         print(f"Processing document: {args.document_file}")
         print(f"Language: {args.language}")
+        print(f"Engine: {args.engine}")
         print(f"DPI: {args.dpi}")
         print(f"Tesseract path: {scanner.tesseract_path}")
         if not scanner.check_poppler():
@@ -95,7 +103,7 @@ Examples:
     
     try:
         # Process the document
-        results = scanner.process_document(args.document_file, args.language)
+        results = scanner.process_document(args.document_file, args.language, engine=args.engine)
         
         if results['total_pages'] == 0:
             print("Error: No pages were processed.", file=sys.stderr)

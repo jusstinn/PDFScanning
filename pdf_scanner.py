@@ -7,19 +7,58 @@ import pytesseract
 from pdf2image import convert_from_path
 import streamlit as st
 import pandas as pd
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
 import tempfile
 import json
 import platform
 import subprocess
 
+# Optional OCR engine imports - set to None initially, import only when needed
+easyocr = None
+keras_ocr = None
+TrOCRProcessor = None
+VisionEncoderDecoderModel = None
+
+# Cloud OCR services - import only when needed
+azure_cv_client = None
+google_vision_client = None
+
 class DocumentScanner:
-    def __init__(self):
-        """Initialize the Document Scanner with OCR capabilities."""
+    def __init__(self, default_engine: str = "tesseract", preprocess_settings: Dict[str, Any] | None = None):
+        """Initialize the Document Scanner with OCR capabilities.
+
+        Args:
+            default_engine: OCR engine to use if none is specified when calling processing functions.
+            preprocess_settings: Optional dictionary with preprocessing flags (see ``preprocess_image`` for keys).
+        """
         self.supported_formats = ['.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
+
+        # Default OCR engine
+        self.default_engine = default_engine.lower()
+
+        # Tesseract setup (if available)
         self.tesseract_path = self.find_tesseract()
         if self.tesseract_path:
             pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
+
+        # Lazy-loaded engine objects (they will be created on first use)
+        self._easyocr_reader = None
+        self._keras_pipeline = None
+        self._trocr_processor = None
+        self._trocr_model = None
+        
+        # Cloud OCR clients (lazy-loaded)
+        self._azure_client = None
+        self._google_client = None
+
+        # Pre-processing configuration (flags)
+        self.preprocess_settings = preprocess_settings or {
+            "grayscale": True,
+            "resize_factor": 2,
+            "denoise": True,
+            "thresholding": "otsu",  # 'otsu', 'gaussian', or None
+            "clahe": False,
+        }
     
     def find_tesseract(self) -> str:
         """
@@ -111,38 +150,83 @@ class DocumentScanner:
         except Exception:
             return False
     
-    def preprocess_image(self, image: Image.Image) -> np.ndarray:
-        """
-        Preprocess image for better OCR results.
+    def preprocess_image(
+        self,
+        image: Image.Image,
+        grayscale: bool | None = None,
+        resize_factor: int | float | None = None,
+        denoise: bool | None = None,
+        thresholding: str | None = None,
+        clahe: bool | None = None,
+    ) -> np.ndarray:
+        """Comprehensive image preprocessing pipeline for OCR.
+
+        All parameters are optional. If a parameter is **None**, the value from
+        :pyattr:`self.preprocess_settings` is used. This makes it possible to
+        configure defaults at *DocumentScanner* creation and still override
+        them per-call if needed.
         
         Args:
-            image: PIL Image to preprocess
+            image: Source :class:`PIL.Image.Image`.
+            grayscale: Convert to grayscale.
+            resize_factor: Scale factor for *cv2.resize* using **INTER_CUBIC**.
+            denoise: Apply *medianBlur* (kernel size 3).
+            thresholding: "otsu", "gaussian", or ``None``.
+            clahe: Apply CLAHE contrast enhancement (useful for handwriting).
             
         Returns:
-            Preprocessed image as numpy array
+            Pre-processed image as a NumPy array ready for OCR.
         """
-        # Convert PIL image to OpenCV format
-        img_array = np.array(image)
-        
-        # Convert to grayscale if it's RGB
-        if len(img_array.shape) == 3:
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = img_array
-            
-        # Apply noise reduction
-        denoised = cv2.medianBlur(gray, 3)
-        
-        # Apply thresholding to get binary image
-        _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # Apply morphological operations to clean up the image
+
+        # Fallback to configured defaults when parameters are omitted
+        settings = {
+            "grayscale": grayscale if grayscale is not None else self.preprocess_settings.get("grayscale", True),
+            "resize_factor": resize_factor if resize_factor is not None else self.preprocess_settings.get("resize_factor", 2),
+            "denoise": denoise if denoise is not None else self.preprocess_settings.get("denoise", True),
+            "thresholding": thresholding if thresholding is not None else self.preprocess_settings.get("thresholding", "otsu"),
+            "clahe": clahe if clahe is not None else self.preprocess_settings.get("clahe", False),
+        }
+
+        # Convert PIL image to OpenCV array
+        img = np.array(image)
+
+        # 1. Grayscale conversion
+        if settings["grayscale"] and len(img.shape) == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        # 2. Resize (upsample) – helps with low-res scans / handwriting
+        if settings["resize_factor"] and settings["resize_factor"] > 1:
+            new_size = (int(img.shape[1] * settings["resize_factor"]), int(img.shape[0] * settings["resize_factor"]))
+            img = cv2.resize(img, new_size, interpolation=cv2.INTER_CUBIC)
+
+        # 3. CLAHE (contrast limited adaptive histogram equalization)
+        if settings["clahe"]:
+            clahe_obj = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            img = clahe_obj.apply(img)
+
+        # 4. Denoise (median blur)
+        if settings["denoise"]:
+            img = cv2.medianBlur(img, 3)
+
+        # 5. Thresholding – convert to binary
+        if settings["thresholding"] == "otsu":
+            _, img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        elif settings["thresholding"] == "gaussian":
+            img = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY, 31, 2)
+
+        # 6. Morphological close to remove small holes and connect text regions
         kernel = np.ones((1, 1), np.uint8)
-        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        
-        return cleaned
+        img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel)
+
+        return img
     
-    def extract_text_from_image(self, image: Image.Image, lang: str = 'eng') -> str:
+    def extract_text_from_image(
+        self,
+        image: Image.Image,
+        lang: str = 'eng',
+        engine: str | None = None,
+    ) -> str:
         """
         Extract text from a single image using OCR.
         
@@ -154,26 +238,200 @@ class DocumentScanner:
             Extracted text as string
         """
         try:
-            # Check if Tesseract is available
-            if not self.tesseract_path:
-                st.error("Tesseract OCR is not installed or not found. Please install Tesseract OCR.")
-                return ""
-            
-            # Preprocess the image
+
+            selected_engine = (engine or self.default_engine or "tesseract").lower()
+
+            # Preprocess the image once (some engines work better on RGB so keep original too)
             processed_img = self.preprocess_image(image)
+
+            # -----------------------------
+            # 1) Tesseract
+            # -----------------------------
+            if selected_engine == "tesseract":
+                if not self.tesseract_path:
+                    st.error("Tesseract OCR is not installed or not found. Please install Tesseract OCR.")
+                    return ""
+
+                custom_config = (
+                    r"--oem 3 --psm 6 -c preserve_interword_spaces=1 "
+                    r"-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,;:!?()[]{}\"'-_+=@#$%&*<>/|\\"
+                )
+                text = pytesseract.image_to_string(processed_img, lang=lang, config=custom_config)
             
-            # Configure OCR parameters for better text extraction
-            # PSM 6: Assume a uniform block of text
-            # OEM 3: Default OCR Engine Mode
-            # Add character recognition mode for better results
-            custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,;:!?()[]{}"\'-_+=@#$%&*<>/|\\'
-            
-            # Extract text using pytesseract
-            text = pytesseract.image_to_string(processed_img, lang=lang, config=custom_config)
-            
-            # Clean up the extracted text
+            # -----------------------------
+            # 2) EasyOCR
+            # -----------------------------
+            elif selected_engine == "easyocr":
+                try:
+                    global easyocr
+                    if easyocr is None:
+                        import easyocr
+                except ImportError:
+                    st.error("EasyOCR is not installed. Install with 'pip install easyocr'.")
+                    return ""
+                if self._easyocr_reader is None:
+                    # Use lang split by + and limit to available easyocr codes
+                    langs = [l for l in lang.split("+") if l]
+                    self._easyocr_reader = easyocr.Reader(langs, gpu=False)
+                result = self._easyocr_reader.readtext(np.array(image))
+                text = "\n".join([res[1] for res in result])
+
+            # -----------------------------
+            # 3) Keras-OCR
+            # -----------------------------
+            elif selected_engine == "keras":
+                try:
+                    global keras_ocr
+                    if keras_ocr is None:
+                        import keras_ocr
+                except ImportError:
+                    st.error("Keras-OCR is not installed. Install with 'pip install keras-ocr'.")
+                    return ""
+                except Exception as e:
+                    st.error(f"Keras-OCR compatibility issue: {str(e)}. Try downgrading NumPy: 'pip install numpy<2.0'")
+                    return ""
+                if self._keras_pipeline is None:
+                    self._keras_pipeline = keras_ocr.pipeline.Pipeline()
+                prediction_groups = self._keras_pipeline.recognize([np.array(image)])
+                text_lines = [" ".join([word[0] for word in line]) for line in prediction_groups[0]]
+                text = "\n".join(text_lines)
+
+            # -----------------------------
+            # 4) TrOCR (Transformer OCR)
+            # -----------------------------
+            elif selected_engine == "trocr":
+                try:
+                    global TrOCRProcessor, VisionEncoderDecoderModel
+                    if TrOCRProcessor is None or VisionEncoderDecoderModel is None:
+                        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+                except ImportError:
+                    st.error("TrOCR dependencies not installed. Install with 'pip install transformers sentencepiece'.")
+                    return ""
+                if self._trocr_model is None:
+                    with st.spinner("Loading TrOCR model (first time only)..."):
+                        self._trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-handwritten")
+                        self._trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-handwritten")
+                pixel_values = self._trocr_processor(images=image, return_tensors="pt").pixel_values
+                generated_ids = self._trocr_model.generate(pixel_values)
+                text = self._trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+            # -----------------------------
+            # 5) Microsoft Azure Computer Vision OCR
+            # -----------------------------
+            elif selected_engine == "azure":
+                try:
+                    global azure_cv_client
+                    if azure_cv_client is None:
+                        from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+                        from azure.cognitiveservices.vision.computervision.models import OperationStatusCodes
+                        from msrest.authentication import CognitiveServicesCredentials
+                        azure_cv_client = True  # Mark as imported
+                except ImportError:
+                    st.error("Azure Computer Vision SDK not installed. Install with 'pip install azure-cognitiveservices-vision-computervision'.")
+                    return ""
+                
+                # Check for Azure credentials
+                azure_key = os.getenv('AZURE_CV_KEY')
+                azure_endpoint = os.getenv('AZURE_CV_ENDPOINT')
+                
+                if not azure_key or not azure_endpoint:
+                    st.error("Azure credentials not found. Please set AZURE_CV_KEY and AZURE_CV_ENDPOINT environment variables.")
+                    st.info("Get your credentials from: https://portal.azure.com/ → Create Computer Vision resource")
+                    return ""
+                
+                try:
+                    if self._azure_client is None:
+                        from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+                        from msrest.authentication import CognitiveServicesCredentials
+                        self._azure_client = ComputerVisionClient(azure_endpoint, CognitiveServicesCredentials(azure_key))
+                    
+                    # Convert PIL image to bytes
+                    import io
+                    img_byte_arr = io.BytesIO()
+                    image.save(img_byte_arr, format='PNG')
+                    img_byte_arr.seek(0)
+                    
+                    # Call Azure OCR
+                    with st.spinner("Processing with Azure OCR..."):
+                        from azure.cognitiveservices.vision.computervision.models import OperationStatusCodes
+                        read_response = self._azure_client.read_in_stream(img_byte_arr, raw=True)
+                        operation_id = read_response.headers["Operation-Location"].split("/")[-1]
+                        
+                        # Wait for result
+                        import time
+                        while True:
+                            read_result = self._azure_client.get_read_result(operation_id)
+                            if read_result.status not in ['notStarted', 'running']:
+                                break
+                            time.sleep(1)
+                        
+                        # Extract text
+                        text_lines = []
+                        if read_result.status == OperationStatusCodes.succeeded:
+                            for text_result in read_result.analyze_result.read_results:
+                                for line in text_result.lines:
+                                    text_lines.append(line.text)
+                        text = "\n".join(text_lines)
+                except Exception as e:
+                    st.error(f"Azure OCR error: {str(e)}")
+                    return ""
+
+            # -----------------------------
+            # 6) Google Cloud Vision OCR
+            # -----------------------------
+            elif selected_engine == "google":
+                try:
+                    global google_vision_client
+                    if google_vision_client is None:
+                        from google.cloud import vision
+                        google_vision_client = True  # Mark as imported
+                except ImportError:
+                    st.error("Google Cloud Vision SDK not installed. Install with 'pip install google-cloud-vision'.")
+                    return ""
+                
+                # Check for Google credentials
+                google_creds = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+                if not google_creds:
+                    st.error("Google Cloud credentials not found. Please set GOOGLE_APPLICATION_CREDENTIALS environment variable.")
+                    st.info("Get your credentials from: https://console.cloud.google.com/ → Create Vision API service account key")
+                    return ""
+                
+                try:
+                    if self._google_client is None:
+                        from google.cloud import vision
+                        self._google_client = vision.ImageAnnotatorClient()
+                    
+                    # Convert PIL image to bytes
+                    import io
+                    img_byte_arr = io.BytesIO()
+                    image.save(img_byte_arr, format='PNG')
+                    img_byte_arr.seek(0)
+                    
+                    # Call Google Vision OCR
+                    with st.spinner("Processing with Google Cloud Vision..."):
+                        from google.cloud import vision
+                        google_image = vision.Image(content=img_byte_arr.getvalue())
+                        response = self._google_client.text_detection(image=google_image)
+                        
+                        if response.error.message:
+                            st.error(f"Google Vision API error: {response.error.message}")
+                            return ""
+                        
+                        # Extract text
+                        texts = response.text_annotations
+                        if texts:
+                            text = texts[0].description  # First annotation contains full text
+                        else:
+                            text = ""
+                except Exception as e:
+                    st.error(f"Google Cloud Vision error: {str(e)}")
+                    return ""
+
+            else:
+                st.error(f"Unsupported OCR engine: {selected_engine}")
+                return ""
+
             cleaned_text = self.clean_extracted_text(text)
-            
             return cleaned_text
         except Exception as e:
             st.error(f"Error extracting text from image: {str(e)}")
@@ -215,7 +473,7 @@ class DocumentScanner:
         
         return cleaned_text.strip()
     
-    def process_document(self, file_path: str, lang: str = 'eng') -> Dict[str, any]:
+    def process_document(self, file_path: str, lang: str = 'eng', engine: str | None = None) -> Dict[str, any]:
         """
         Process a document (PDF or image) and extract text.
         
@@ -245,13 +503,13 @@ class DocumentScanner:
             
             # Process each page/image
             for i, image in enumerate(images):
-                page_text = self.extract_text_from_image(image, lang)
+                results_page_text = self.extract_text_from_image(image, lang=lang, engine=engine)
                 results['pages'].append({
                     'page_number': i + 1,
-                    'text': page_text,
-                    'word_count': len(page_text.split())
+                    'text': results_page_text,
+                    'word_count': len(results_page_text.split())
                 })
-                results['full_text'] += f"\n--- Page {i + 1} ---\n{page_text}"
+                results['full_text'] += f"\n--- Page {i + 1} ---\n{results_page_text}"
             
             return results
             
@@ -306,11 +564,39 @@ def main():
     
     # Sidebar for configuration
     st.sidebar.header("Configuration")
+
+    ocr_engine = st.sidebar.selectbox(
+        "OCR Engine",
+        ["tesseract", "easyocr", "keras", "trocr", "azure", "google"],
+        help="Choose which OCR backend to use (cloud engines require API credentials)"
+    )
+
     language = st.sidebar.selectbox(
         "OCR Language",
         ["eng", "eng+ron", "ron", "fra", "deu", "spa", "ita", "por", "rus", "chi_sim", "jpn"],
         help="Select the language of the text in your PDF (eng for best character recognition)"
     )
+    
+    # Show cloud engine setup info
+    if ocr_engine in ["azure", "google"]:
+        st.sidebar.markdown("### Cloud Engine Setup")
+        if ocr_engine == "azure":
+            st.sidebar.info("""
+            **Azure Computer Vision Setup:**
+            1. Install: `pip install azure-cognitiveservices-vision-computervision`
+            2. Set environment variables:
+               - `AZURE_CV_KEY=your_key`
+               - `AZURE_CV_ENDPOINT=your_endpoint`
+            3. Get credentials from [Azure Portal](https://portal.azure.com/)
+            """)
+        elif ocr_engine == "google":
+            st.sidebar.info("""
+            **Google Cloud Vision Setup:**
+            1. Install: `pip install google-cloud-vision`
+            2. Set environment variable:
+               - `GOOGLE_APPLICATION_CREDENTIALS=path/to/key.json`
+            3. Get credentials from [Google Cloud Console](https://console.cloud.google.com/)
+            """)
     
     dpi = st.sidebar.slider(
         "Image Resolution (DPI)",
@@ -347,7 +633,7 @@ def main():
             if st.button("🔍 Extract Text", type="primary"):
                 with st.spinner("Processing document..."):
                     # Process the document
-                    results = scanner.process_document(file_path, language)
+                    results = scanner.process_document(file_path, language, engine=ocr_engine)
                 
                 if results['total_pages'] > 0:
                     st.success(f"✅ Successfully processed {results['total_pages']} pages!")
